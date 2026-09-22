@@ -62,6 +62,7 @@ import org.apache.commons.io.FileDeleteStrategy;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -110,6 +111,7 @@ import org.dspace.eperson.service.GroupService;
 import org.dspace.handle.service.HandleService;
 import org.dspace.scripts.handler.DSpaceRunnableHandler;
 import org.dspace.services.ConfigurationService;
+import org.dspace.storage.secure.SecureFileAccess;
 import org.dspace.workflow.WorkflowItem;
 import org.dspace.workflow.WorkflowService;
 import org.springframework.beans.factory.InitializingBean;
@@ -201,7 +203,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         //Ensure tempWorkDir exists
         File tempWorkDirFile = new File(tempWorkDir);
         if (!tempWorkDirFile.exists()) {
-            boolean success = tempWorkDirFile.mkdir();
+            boolean success = tempWorkDirFile.mkdirs();
             if (success) {
                 logInfo("Created org.dspace.app.batchitemimport.work.dir of: " + tempWorkDir);
             } else {
@@ -209,7 +211,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             }
         }
         // clean work dir path from duplicate separators
-        tempWorkDir = StringUtils.replace(tempWorkDir, File.separator + File.separator, File.separator);
+        tempWorkDir = Strings.CS.replace(tempWorkDir, File.separator + File.separator, File.separator);
     }
 
     // File listing filter to look for metadata files
@@ -982,7 +984,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         }
         // only add metadata if it is no test and there is an actual value
         if (!isTest && !value.equals("")) {
-            if (StringUtils.equals(schema, MetadataSchemaEnum.RELATION.getName())) {
+            if (Strings.CS.equals(schema, MetadataSchemaEnum.RELATION.getName())) {
                 Item relationItem = resolveItem(c, value);
                 if (relationItem == null) {
                     throw new IllegalArgumentException("No item found with id=" + value);
@@ -1976,18 +1978,21 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
         File tempdir = new File(destinationDir);
         if (!tempdir.isDirectory()) {
-            logError("'" + configurationService.getProperty("org.dspace.app.batchitemimport.work.dir") +
-                          "' as defined by the key 'org.dspace.app.batchitemimport.work.dir' in dspace.cfg " +
-                          "is not a valid directory");
+            logError("'" + destinationDir + "' is not a valid directory");
         }
 
         if (!tempdir.exists() && !tempdir.mkdirs()) {
             logError("Unable to create temporary directory: " + tempdir.getAbsolutePath());
         }
         String sourcedir = destinationDir + System.getProperty("file.separator") + zipfile.getName();
-        String zipDir = destinationDir + System.getProperty("file.separator") + zipfile.getName() + System
-            .getProperty("file.separator");
+        String zipDir = sourcedir + System.getProperty("file.separator");
+        File sourcedirFile = new File(sourcedir);
 
+        // Create the source directory we will be unzipping into. We must pre-create this directory to validate
+        // the final path of each zip entry using SecureFileAccess (see below)
+        if (!sourcedirFile.exists() && !sourcedirFile.mkdirs()) {
+            logError("Unable to create directory for unzipping: " + sourcedir);
+        }
 
         // 3
         String sourceDirForZip = sourcedir;
@@ -1998,13 +2003,22 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             while (entries.hasMoreElements()) {
                 entry = entries.nextElement();
                 String entryName = entry.getName();
-                File outFile = new File(zipDir + entryName);
+
                 // Verify that this file/directory will be extracted into our zipDir (and not somewhere else!)
-                if (!outFile.toPath().normalize().startsWith(zipDir)) {
+                Path validatedOutPath;
+                try {
+                    String fileAbsolutePath =
+                        SecureFileAccess.calculateAbsolutePathUsingBaseDir(entryName, zipDir);
+                    validatedOutPath = SecureFileAccess.validatePathForWrite(fileAbsolutePath, List.of(zipDir),
+                                                                             "ItemImport zip entry extraction");
+                } catch (IOException e) {
                     throw new IOException("Bad zip entry: '" + entryName
                                               + "' in file '" + zipfile.getAbsolutePath() + "'!"
-                                              + " Cannot process this file or directory.");
+                                              + " Cannot process this file or directory.", e);
                 }
+
+                File outFile = validatedOutPath.toFile();
+
                 if (entry.isDirectory()) {
                     if (!outFile.mkdirs()) {
                         logError("Unable to create contents directory: " + zipDir + entry.getName());
@@ -2033,7 +2047,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                         //regex supports either windows or *nix file paths
                         String[] entryChunks = entryName.split("/|\\\\");
                         if (entryChunks.length > 2) {
-                            if (StringUtils.equals(sourceDirForZip, sourcedir)) {
+                            if (Strings.CS.equals(sourceDirForZip, sourcedir)) {
                                 sourceDirForZip = sourcedir + "/" + entryChunks[0];
                             }
                         }
@@ -2050,12 +2064,19 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                     out.close();
                 }
             }
+        } catch (Exception e) {
+            // If an error occurs in unzipping, cleanup the directory we were unzipping this file into
+            if (sourcedirFile.exists()) {
+                FileUtils.deleteDirectory(sourcedirFile);
+            }
+            // Then throw error upwards
+            throw e;
         } finally {
             //Close zip file
             zf.close();
         }
 
-        if (!StringUtils.equals(sourceDirForZip, sourcedir)) {
+        if (!Strings.CS.equals(sourceDirForZip, sourcedir)) {
             sourcedir = sourceDirForZip;
             logInfo("Set sourceDir using path inside of Zip: " + sourcedir);
         }
